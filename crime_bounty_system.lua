@@ -41,8 +41,9 @@ local CONFIG = {
     CiviliansMaxLevel   = 50,
 
     -- Hunter spawn chance per tick (percentage per star)
-    -- Example: level 1 = 20%, level 5 = 100%
-    HunterSpawnChancePerStar = 20,
+    -- 100 = always spawn the configured hunters at every level.
+    -- Lower values (e.g. 20) make spawns random: level 1 = 20%, level 5 = 100%.
+    HunterSpawnChancePerStar = 100,
 
     -- Hunter entries per wanted level.
     -- Each level can spawn multiple hunters (e.g. 2 normal hunters at level 2).
@@ -72,18 +73,28 @@ local function DB_Init()
     WorldDBExecute([[
         CREATE TABLE IF NOT EXISTS `crime_system_players` (
             `guid` INT UNSIGNED NOT NULL,
+            `player_name` VARCHAR(12) NOT NULL DEFAULT '',
+            `player_team` TINYINT UNSIGNED NOT NULL DEFAULT 0,
             `wanted_level` TINYINT UNSIGNED NOT NULL DEFAULT 0,
             `bounty` INT UNSIGNED NOT NULL DEFAULT 0,
             `last_crime` INT UNSIGNED NOT NULL DEFAULT 0,
             PRIMARY KEY (`guid`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     ]])
+    -- Migration: add columns if they don't exist (older versions)
+    local colCheck = WorldDBQuery("SHOW COLUMNS FROM `crime_system_players` LIKE 'player_name'")
+    if not colCheck then
+        WorldDBExecute("ALTER TABLE `crime_system_players` ADD COLUMN `player_name` VARCHAR(12) NOT NULL DEFAULT '' AFTER `guid`")
+        WorldDBExecute("ALTER TABLE `crime_system_players` ADD COLUMN `player_team` TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER `player_name`")
+    end
 end
 
 local function DB_Load(guid)
     local result = WorldDBQuery("SELECT wanted_level, bounty, last_crime FROM crime_system_players WHERE guid = " .. guid)
     if result then
         return {
+            name      = '',
+            team      = 0,
             level     = result:GetUInt32(0),
             bounty    = result:GetUInt32(1),
             lastCrime = result:GetUInt32(2)
@@ -93,14 +104,49 @@ local function DB_Load(guid)
 end
 
 local function DB_Save(guid, data)
+    local name = data.name or ''
+    local team = data.team or 0
     WorldDBExecute(string.format(
-        "REPLACE INTO crime_system_players (guid, wanted_level, bounty, last_crime) VALUES (%d, %d, %d, %d)",
-        guid, data.level, data.bounty, data.lastCrime
+        "REPLACE INTO crime_system_players (guid, player_name, player_team, wanted_level, bounty, last_crime) VALUES (%d, '%s', %d, %d, %d, %d)",
+        guid, name, team, data.level, data.bounty, data.lastCrime
     ))
 end
 
 local function DB_Clear(guid)
     WorldDBExecute("DELETE FROM crime_system_players WHERE guid = " .. guid)
+end
+
+local function DB_LoadAllWanted()
+    local result = WorldDBQuery("SELECT guid, wanted_level, bounty FROM crime_system_players WHERE wanted_level > 0 ORDER BY wanted_level DESC")
+    local players = {}
+    if result then
+        repeat
+            local guid = result:GetUInt32(0)
+            local level = result:GetUInt32(1)
+            local bounty = result:GetUInt32(2)
+            -- Try to get name and team from memory first (online players)
+            local memData = CrimeSystem.WantedData[guid]
+            if memData then
+                table.insert(players, {
+                    guid   = guid,
+                    name   = memData.name or tostring(guid),
+                    team   = memData.team or 0,
+                    level  = level,
+                    bounty = bounty
+                })
+            else
+                -- Offline player — show GUID as placeholder
+                table.insert(players, {
+                    guid   = guid,
+                    name   = tostring(guid),
+                    team   = 0,
+                    level  = level,
+                    bounty = bounty
+                })
+            end
+        until not result:NextRow()
+    end
+    return players
 end
 
 -- ============================
@@ -110,13 +156,15 @@ function CrimeSystem.AddWantedLevel(player, amount)
     Log("AddWantedLevel called for " .. player:GetName() .. " amount=" .. amount)
     local guid = player:GetGUIDLow()
     if not CrimeSystem.WantedData[guid] then
-        CrimeSystem.WantedData[guid] = {level = 0, bounty = 0, lastCrime = 0}
+        CrimeSystem.WantedData[guid] = {level = 0, bounty = 0, lastCrime = 0, name = player:GetName(), team = player:GetTeam()}
     end
 
     local data = CrimeSystem.WantedData[guid]
     data.level = math.min(data.level + amount, CONFIG.MaxWantedLevel)
     data.bounty = data.level * CONFIG.BountyPerStar
     data.lastCrime = os.time()
+    data.name = player:GetName()
+    data.team = player:GetTeam()
 
     DB_Save(guid, data)
     Log("Saved to DB: guid=" .. guid .. " level=" .. data.level .. " bounty=" .. data.bounty)
@@ -265,6 +313,8 @@ local function OnPlayerLogin(event, player)
     Log("OnPlayerLogin: " .. player:GetName() .. " (GUID: " .. guid .. ")")
     local data = DB_Load(guid)
     if data and data.level > 0 then
+        data.name = data.name or player:GetName()
+        data.team = data.team or player:GetTeam()
         CrimeSystem.WantedData[guid] = data
         player:SendBroadcastMessage(
             string.format("|cFFFF0000[WANTED] You are still wanted! Level %d/%d | Bounty: %d gold|r", data.level, CONFIG.MaxWantedLevel, data.level * 50)
@@ -277,6 +327,8 @@ local function OnPlayerLogout(event, player)
     local guid = player:GetGUIDLow()
     local data = CrimeSystem.WantedData[guid]
     if data then
+        data.name = data.name or player:GetName()
+        data.team = data.team or player:GetTeam()
         DB_Save(guid, data)
     end
     CrimeSystem.CampData[guid] = nil
@@ -340,6 +392,58 @@ local function OnHunterTargetDied(event, creature, target)
 end
 
 -- ============================
+-- BOUNTY BOARD NPC (entry 900013)
+-- Shows wanted players from the OPPOSING faction only.
+-- Displays list in the gossip window with faction colors.
+-- ============================
+local function OnBountyBoardHello(event, player, creature)
+    local viewerTeam = player:GetTeam() -- 0 = Alliance, 1 = Horde
+    local targetTeam = (viewerTeam == 0) and 1 or 0
+    local targetTag = (targetTeam == 0) and "Alliance" or "Horde"
+    local allWanted = DB_LoadAllWanted()
+
+    -- Filter to show only opposing faction wanted players
+    local filtered = {}
+    for _, wp in ipairs(allWanted) do
+        if wp.team == targetTeam then
+            table.insert(filtered, wp)
+        end
+    end
+
+    player:GossipClearMenu()
+
+    -- Header
+    local headerColor = (targetTeam == 0) and "|cff00aaff" or "|cffff0000"
+    player:GossipMenuAddItem(0, string.format("%s=== %s BOUNTY LIST ===|r", headerColor, targetTag), 1, 0)
+
+    if #filtered == 0 then
+        player:GossipMenuAddItem(0, "No wanted players found.", 1, 0)
+    else
+        for _, wp in ipairs(filtered) do
+            local tagColor = (wp.team == 0) and "|cff00aaff" or "|cffff0000"
+            local tagShort = (wp.team == 0) and "A" or "H"
+            local gold = wp.level * 50
+            local line = string.format("%s[%s]|r %s |cff00ff00Lv%d|r %dg",
+                tagColor, tagShort, wp.name, wp.level, gold)
+            player:GossipMenuAddItem(5, line, 2, wp.guid)
+        end
+    end
+
+    player:GossipMenuAddItem(5, "----------------------", 1, 0)
+    player:GossipMenuAddItem(0, "Refresh", 1, 99)
+    player:GossipMenuAddItem(0, "Close", 1, 100)
+    player:GossipSendMenu(1, creature)
+end
+
+local function OnBountyBoardSelect(event, player, creature, sender, intid, code)
+    if intid == 99 then
+        OnBountyBoardHello(event, player, creature)
+    else
+        player:GossipComplete()
+    end
+end
+
+-- ============================
 -- INIT
 -- ============================
 DB_Init()
@@ -348,6 +452,9 @@ RegisterPlayerEvent(3,  OnPlayerLogin)
 RegisterPlayerEvent(4,  OnPlayerLogout)
 RegisterPlayerEvent(6,  OnPlayerKillPlayer)
 RegisterPlayerEvent(7,  OnPlayerKillCreature)
+
+RegisterCreatureGossipEvent(900013, 1, OnBountyBoardHello)
+RegisterCreatureGossipEvent(900013, 2, OnBountyBoardSelect)
 
 -- Register spawn and death events for all hunter entries
 for _, spawnList in pairs(CONFIG.HunterSpawnTable) do
