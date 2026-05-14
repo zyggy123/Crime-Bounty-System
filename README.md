@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="https://github.com/zyggy123/Crime-Bounty-System/blob/main/icon.png" width="200" />
+</p>
 # Crime & Bounty System
 
 **AzerothCore Eluna module** — WoTLK 3.3.5a
